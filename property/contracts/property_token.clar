@@ -1,6 +1,4 @@
 ;; Intellectual Property Token Contract
-;; Author: Claude
-;; Version: 1.0
 ;; Description: A smart contract for tokenizing intellectual property rights
 
 ;; Constants and Token Configuration
@@ -13,6 +11,10 @@
 (define-constant err-license-expired (err u105))
 (define-constant err-invalid-royalty (err u106))
 (define-constant err-zero-payment (err u107))
+(define-constant err-license-not-found (err u108))
+(define-constant err-no-royalties (err u109))
+(define-constant err-payment-failed (err u110))
+(define-constant err-royalty-payment-failed (err u111))
 
 ;; Data storage
 (define-map ip-tokens
@@ -75,10 +77,7 @@
 )
 
 (define-read-only (get-token-info (token-id uint))
-  (match (map-get? ip-tokens { token-id: token-id })
-    token-info token-info
-    (err err-token-id-not-found)
-  )
+  (map-get? ip-tokens { token-id: token-id })
 )
 
 (define-read-only (get-token-owner (token-id uint))
@@ -91,7 +90,7 @@
 (define-read-only (get-license-info (token-id uint) (licensee principal))
   (match (map-get? licenses { token-id: token-id, licensee: licensee })
     license-info (ok license-info)
-    (err u108) ;; License not found
+    (err err-license-not-found)
   )
 )
 
@@ -99,12 +98,16 @@
   (default-to { amount: u0 } (map-get? creator-revenue { creator: creator }))
 )
 
+(define-read-only (get-current-block-height)
+  burn-block-height
+)
+
 (define-read-only (is-license-valid (token-id uint) (licensee principal))
   (match (map-get? licenses { token-id: token-id, licensee: licensee })
     license-info 
       (and 
         (get active license-info)
-        (> (get expiration license-info) block-height))
+        (> (get expiration license-info) burn-block-height))
     false
   )
 )
@@ -121,7 +124,7 @@
   (let 
     (
       (token-id (var-get token-counter))
-      (creation-date block-height)
+      (creation-date burn-block-height)
     )
     
     ;; Validate royalty percentage (0-100%)
@@ -240,40 +243,19 @@
   )
 )
 
-;; Issue a license for the IP
-(define-public (issue-license 
-                (token-id uint)
-                (licensee principal)
-                (duration uint)
-                (license-type (string-ascii 64))
-                (license-terms (string-utf8 1024))
-                (payment uint))
-  (let
-    (
-      (token-info (unwrap! (map-get? ip-tokens { token-id: token-id }) (err err-token-id-not-found)))
-      (current-owner (unwrap! (get-token-owner token-id) (err err-token-id-not-found)))
-      (royalty-amount (* payment (/ (get royalty-percentage token-info) u100)))
-      (owner-amount (- payment royalty-amount))
-      (creator (get creator token-info))
-      (start-time block-height)
-      (expiration (+ block-height duration))
-    )
-    
-    ;; Ensure only owner can issue license
-    (asserts! (is-eq tx-sender current-owner) (err err-not-token-owner))
-    
-    ;; Check payment is not zero
-    (asserts! (> payment u0) (err err-zero-payment))
-    
-    ;; Transfer payment from licensee
-    (try! (stx-transfer? payment licensee tx-sender))
-    
-    ;; If creator is not the owner, send royalties
-    (if (not (is-eq creator current-owner))
+;; Helper function to handle royalty payments
+(define-private (handle-royalty-payment
+                 (token-id uint)
+                 (licensee principal)
+                 (payment uint)
+                 (royalty-amount uint)
+                 (creator principal)
+                 (current-owner principal))
+  (begin
+    ;; Transfer royalty to creator
+    (match (stx-transfer? royalty-amount current-owner creator)
+      success
         (begin
-          ;; Transfer royalty to creator
-          (try! (stx-transfer? royalty-amount tx-sender creator))
-          
           ;; Update creator revenue
           (let ((current-revenue (get amount (get-creator-revenue creator))))
             (map-set creator-revenue
@@ -290,28 +272,73 @@
                 from: licensee,
                 to: creator,
                 amount: royalty-amount,
-                timestamp: block-height
+                timestamp: burn-block-height
               }
             )
             (var-set royalty-tx-counter (+ tx-id u1))
           )
+          
+          (ok true)
         )
-        true
+      error (err err-royalty-payment-failed)
+    )
+  )
+)
+
+;; Issue a license for the IP
+(define-public (issue-license 
+                (token-id uint)
+                (licensee principal)
+                (duration uint)
+                (license-type (string-ascii 64))
+                (license-terms (string-utf8 1024))
+                (payment uint))
+  (let
+    (
+      (token-info (unwrap! (map-get? ip-tokens { token-id: token-id }) (err err-token-id-not-found)))
+      (current-owner (unwrap! (get-token-owner token-id) (err err-token-id-not-found)))
+      (royalty-amount (* payment (/ (get royalty-percentage token-info) u100)))
+      (owner-amount (- payment royalty-amount))
+      (creator (get creator token-info))
+      (current-height burn-block-height)
+      (start-time current-height)
+      (expiration (+ current-height duration))
     )
     
-    ;; Store license details
-    (map-set licenses
-      { token-id: token-id, licensee: licensee }
-      {
-        start-time: start-time,
-        expiration: expiration,
-        license-type: license-type,
-        license-terms: license-terms,
-        active: true
-      }
-    )
+    ;; Ensure only owner can issue license
+    (asserts! (is-eq tx-sender current-owner) (err err-not-token-owner))
     
-    (ok true)
+    ;; Check payment is not zero
+    (asserts! (> payment u0) (err err-zero-payment))
+    
+    ;; Transfer payment from licensee
+    (match (stx-transfer? payment licensee tx-sender)
+      payment-success
+        (begin
+          ;; If creator is not the owner, send royalties
+          (if (not (is-eq creator current-owner))
+              ;; Handle royalty payment and store license if successful
+              (unwrap! (handle-royalty-payment token-id licensee payment royalty-amount creator current-owner) 
+                      (err err-royalty-payment-failed))
+              true
+          )
+          
+          ;; Store license details
+          (map-set licenses
+            { token-id: token-id, licensee: licensee }
+            {
+              start-time: start-time,
+              expiration: expiration,
+              license-type: license-type,
+              license-terms: license-terms,
+              active: true
+            }
+          )
+          
+          (ok true)
+        )
+      payment-error (err err-payment-failed)
+    )
   )
 )
 
@@ -320,7 +347,8 @@
   (let
     (
       (current-owner (unwrap! (get-token-owner token-id) (err err-token-id-not-found)))
-      (license-info (unwrap! (map-get? licenses { token-id: token-id, licensee: licensee }) (err u108)))
+      (license-info (unwrap! (map-get? licenses { token-id: token-id, licensee: licensee }) 
+                            (err err-license-not-found)))
     )
     
     ;; Ensure only owner can revoke license
@@ -348,10 +376,12 @@
     (
       (token-info (unwrap! (map-get? ip-tokens { token-id: token-id }) (err err-token-id-not-found)))
       (current-owner (unwrap! (get-token-owner token-id) (err err-token-id-not-found)))
-      (license-info (unwrap! (map-get? licenses { token-id: token-id, licensee: tx-sender }) (err u108)))
+      (license-info (unwrap! (map-get? licenses { token-id: token-id, licensee: tx-sender }) 
+                            (err err-license-not-found)))
       (royalty-amount (* payment (/ (get royalty-percentage token-info) u100)))
       (owner-amount (- payment royalty-amount))
       (creator (get creator token-info))
+      (current-height burn-block-height)
       (new-expiration (+ (get expiration license-info) additional-duration))
     )
     
@@ -362,52 +392,33 @@
     (asserts! (> payment u0) (err err-zero-payment))
     
     ;; Transfer payment from licensee to owner
-    (try! (stx-transfer? payment tx-sender current-owner))
-    
-    ;; If creator is not the owner, send royalties
-    (if (not (is-eq creator current-owner))
+    (match (stx-transfer? payment tx-sender current-owner)
+      payment-success
         (begin
-          ;; Transfer royalty to creator
-          (try! (stx-transfer? royalty-amount current-owner creator))
-          
-          ;; Update creator revenue
-          (let ((current-revenue (get amount (get-creator-revenue creator))))
-            (map-set creator-revenue
-              { creator: creator }
-              { amount: (+ current-revenue royalty-amount) }
-            )
+          ;; If creator is not the owner, send royalties
+          (if (not (is-eq creator current-owner))
+              ;; Handle royalty payment
+              (unwrap! (handle-royalty-payment token-id tx-sender payment royalty-amount creator current-owner) 
+                      (err err-royalty-payment-failed))
+              true
           )
           
-          ;; Record royalty transaction
-          (let ((tx-id (var-get royalty-tx-counter)))
-            (map-set royalty-history
-              { token-id: token-id, tx-id: tx-id }
-              {
-                from: tx-sender,
-                to: creator,
-                amount: royalty-amount,
-                timestamp: block-height
-              }
-            )
-            (var-set royalty-tx-counter (+ tx-id u1))
+          ;; Update license with new expiration
+          (map-set licenses
+            { token-id: token-id, licensee: tx-sender }
+            {
+              start-time: (get start-time license-info),
+              expiration: new-expiration,
+              license-type: (get license-type license-info),
+              license-terms: (get license-terms license-info),
+              active: true
+            }
           )
+          
+          (ok true)
         )
-        true
+      payment-error (err err-payment-failed)
     )
-    
-    ;; Update license with new expiration
-    (map-set licenses
-      { token-id: token-id, licensee: tx-sender }
-      {
-        start-time: (get start-time license-info),
-        expiration: new-expiration,
-        license-type: (get license-type license-info),
-        license-terms: (get license-terms license-info),
-        active: true
-      }
-    )
-    
-    (ok true)
   )
 )
 
@@ -420,7 +431,7 @@
     )
     
     ;; Check if there are royalties to withdraw
-    (asserts! (> amount u0) (err u109))
+    (asserts! (> amount u0) (err err-no-royalties))
     
     ;; Reset creator revenue
     (map-set creator-revenue
@@ -429,9 +440,10 @@
     )
     
     ;; Transfer accumulated royalties from contract to creator
-    (try! (as-contract (stx-transfer? amount contract-owner tx-sender)))
-    
-    (ok amount)
+    (match (as-contract (stx-transfer? amount contract-owner tx-sender))
+      transfer-success (ok amount)
+      transfer-error (err err-no-royalties)
+    )
   )
 )
 
